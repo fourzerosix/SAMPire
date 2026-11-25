@@ -1,0 +1,13 @@
+site_name: SAMPire
+site_description: Terminal sampler, chopper and drum machine with an autonomous creative engine
+repo_url: https://github.com/fourzerosix/SAMPire
+theme:
+  name: readthedocs
+nav:
+  - Home: index.md
+  - Design overview: DESIGN.md
+  - Architecture: ARCHITECTURE.md
+  - Creative engine: CREATIVE_ENGINE.md
+  - Project format: PROJECT_FORMAT.md
+  - Keys and commands: KEYS_AND_COMMANDS.md
+  - Roadmap: ROADMAP.md
