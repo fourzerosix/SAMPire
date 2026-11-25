@@ -19,7 +19,7 @@ if [ "${1:-}" = "--uninstall" ]; then
   exit 0
 fi
 
-EXTRA=".[audio,midi]"
+EXTRA=".[all]"
 case "$OS" in
   Linux)
     say "Installing system packages (needs sudo): PortAudio, libsndfile, ALSA headers for MIDI"
@@ -65,8 +65,8 @@ mkdir -p "$(dirname "$VENV")" "$BIN"
 "$VENV/bin/python" -m pip install --quiet --upgrade pip setuptools wheel
 say "Installing SAMPire ($EXTRA)"
 if ! "$VENV/bin/python" -m pip install --upgrade "$EXTRA"; then
-  warn "optional extras failed (usually python-rtmidi); retrying with audio only"
-  "$VENV/bin/python" -m pip install --upgrade ".[audio]"
+  warn "optional extras failed (usually python-rtmidi or aubio); retrying with audio and midi"
+  "$VENV/bin/python" -m pip install --upgrade ".[audio,midi]" || "$VENV/bin/python" -m pip install --upgrade ".[audio]"
 fi
 ln -sf "$VENV/bin/sampire" "$BIN/sampire"
 
