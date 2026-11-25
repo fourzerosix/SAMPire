@@ -1,4 +1,6 @@
-# SAMPire
+![SAMPire](https://raw.githubusercontent.com/fourzerosix/SAMPire/main/assets/images/sampire-logo-full.jpg)
+
+---
 
 A btop-style terminal **sampler, chopper and drum machine** with an autonomous creative engine. Feed it a loop, a
 record, a field recording or a live input. It finds the hits, chops them, labels them, transforms some of them,
