@@ -25,7 +25,8 @@ def pattern_seconds(pr: Project, pat: Pattern, bars: Optional[int] = None) -> fl
 
 
 def render_pattern(pr: Project, pattern: Optional[str] = None, loops: int = 1, tail_s: float = 2.0, seed: Optional[int] = None,
-                   only_pads: Optional[List[int]] = None, block: int = 256) -> np.ndarray:
+                   only_pads: Optional[List[int]] = None, block: int = 256, only_bus: Optional[int] = None,
+                   lufs: Optional[float] = None, ceiling_db: float = -1.0) -> np.ndarray:
     """Offline render of a pattern (or the song when pr.mode == 'song'). Deterministic for a given seed."""
     pr.render_all()
     eng = Engine(pr, block=block, seed=pr.seed if seed is None else seed)
@@ -33,6 +34,8 @@ def render_pattern(pr: Project, pattern: Optional[str] = None, loops: int = 1, t
         pr.current_pattern = pattern
     pat = pr.pattern
     eng.sync_from_project()
+    if only_bus is not None:
+        eng.only_bus, eng.stem_mode = only_bus, True
     if only_pads is not None:
         saved = pat.events
         pat.events = [e for e in pat.events if e.pad in only_pads]
@@ -43,7 +46,11 @@ def render_pattern(pr: Project, pattern: Optional[str] = None, loops: int = 1, t
             secs = sum(pr.patterns[n].bars * pr.patterns[n].beats_per_bar * 60.0 / pr.bpm * max(r, 1) for n, r in pr.song if n in pr.patterns)
         else:
             secs = pattern_seconds(pr, pat) * loops
-        return eng.render(secs + tail_s)
+        y = eng.render(secs + tail_s)
+        if lufs is not None:
+            y, info = dsp.normalize_lufs(y, pr.sr, lufs, ceiling_db)
+            render_pattern.last_info = info
+        return y
     finally:
         if only_pads is not None:
             pat.events = saved
@@ -129,3 +136,20 @@ def pattern_to_midi(pr: Project, pat: Pattern, path: str, channel: int = 9) -> s
     with open(path, "wb") as fh:
         fh.write(data)
     return path
+
+
+def export_bus_stems(pr: Project, outdir: str, pattern: Optional[str] = None, tail_s: float = 2.0) -> List[str]:
+    """One float32 wav per mixer bus that plays in the pattern, with the bus effects, gain and the pads' sends included.
+    Master effects and the limiter are bypassed so the stems sum back to the mix (at the master gain)."""
+    os.makedirs(outdir, exist_ok=True)
+    pat = pr.patterns[pattern] if pattern else pr.pattern
+    used = sorted({int(pr.pad(e.pad).bus) for e in pat.events})
+    files = []
+    for k in used:
+        y = render_pattern(pr, pat.name, 1, tail_s, only_bus=k)
+        name = "bus%d" % (k + 1)
+        custom = (pr.fx_settings.get("buses") or [{}] * 4)[k].get("name", name)
+        f = os.path.join(outdir, "%s.wav" % (name if custom == name else "%s_%s" % (name, _safe(custom))))
+        export_audio(f, y, pr.sr, 32)
+        files.append(f)
+    return files

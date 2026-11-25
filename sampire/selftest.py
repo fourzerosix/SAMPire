@@ -9,7 +9,8 @@ from typing import Callable, List, Tuple
 
 import numpy as np
 
-from . import analysis, asset as assetmod, creative, demo, dsp, export, slicer
+from . import analysis, asset as assetmod, creative, demo, dsp, export, fx as fxmod, library, loops, midi, providers, slicer, stems, taste
+from .bus import NUM_BUSES
 from .config import PPQ, SAMPLE_RATE
 from .engine import Engine
 from .pad import Pad
@@ -18,6 +19,10 @@ from .recorder import RingBuffer, ThresholdRecorder
 from .sequencer import Pattern, Scheduler
 
 SR = SAMPLE_RATE
+
+
+class Skip(Exception):
+    """Raised by a check whose optional dependency is not installed."""
 
 
 def _f0(y: np.ndarray) -> float:
@@ -331,18 +336,529 @@ CHECKS: List[Tuple[str, Callable[[], str]]] = [
 ]
 
 
+# ------------------------------------------------------------------ v0.2 checks
+def _tone_project(n_pads: int = 4, secs: float = 4.0) -> Project:
+    pr = Project("t")
+    a = pr.add_asset(assetmod.asset_from_array(demo.tone(220.0, secs), "t"))
+    for i in range(n_pads):
+        p = pr.pad(i)
+        p.asset_id, p.start, p.end, p.mode = a.id, 0, a.frames, "loop"
+    pr.render_all()
+    return pr
+
+
+def t_fx_rack() -> str:
+    x = demo.drum_break(92, 1)[: SR * 2]
+    worst = 0.0
+    for name in fxmod.list_effects():
+        if name == "pedalboard":
+            continue
+        kw = {"mix": 0.5} if name in ("delay", "reverb") else {}
+        outs = []
+        for block in (64, 1000):
+            f = fxmod.make_fx(name, SR, **kw)
+            outs.append(np.concatenate([f.process(x[i:i + block]) for i in range(0, len(x), block)]))
+        d = float(np.abs(outs[0] - outs[1]).max())
+        assert d < 1e-4 and np.isfinite(outs[0]).all(), "%s differs by %.2e across block sizes" % (name, d)
+        worst = max(worst, d)
+        assert fxmod.from_spec(fxmod.make_fx(name, SR, **kw).spec(), SR).spec() == fxmod.make_fx(name, SR, **kw).spec(), name
+    c = fxmod.make_fx("compressor", SR, threshold_db=-24, ratio=10, attack_ms=1)
+    y = c.process(x[:SR])
+    assert float(np.abs(y).max()) < 0.75 * float(np.abs(x[:SR]).max()), "compressor did not reduce peaks"
+    e = fxmod.make_fx("eq", SR, high_db=-12, high_hz=4000)
+    noise = np.random.default_rng(0).normal(0, 0.2, (SR, 2)).astype(np.float32)
+    ye = e.process(noise)
+    hf = lambda v: float(np.sum(np.abs(np.fft.rfft(v[:, 0])[len(v) // 4:]) ** 2))
+    assert hf(ye) < 0.2 * hf(noise), "eq high cut missing"
+    return "%d effects exact across block sizes (worst %.1e), specs round-trip, compressor and eq work" % (len(fxmod.list_effects()) - 1, worst)
+
+
+def t_buses_sidechain() -> str:
+    pr = _tone_project()
+    pr.pad(1).bus = 1
+    pr.pad(1).pitch = 7
+
+    def run(key_on: bool, only=0):
+        e = Engine(pr)
+        e.only_bus, e.stem_mode, e.master_gain = only, True, 1.0
+        e.buses[0].fx = [fxmod.make_fx("compressor", SR, threshold_db=-40, ratio=20, attack_ms=1, release_ms=100)]
+        e.buses[0].sidechain = 1
+        e.trigger(0, 0.5)
+        if key_on:
+            e.trigger(1, 1.0)
+        e.render(0.2)
+        y = e.render(0.2)
+        return float(np.sqrt(np.mean(y ** 2)))
+
+    free, ducked = run(False), run(True)
+    assert ducked < 0.2 * free, "sidechain did not duck (%.3f vs %.3f)" % (ducked, free)
+
+    def r(only):
+        e = Engine(pr)
+        e.master_gain, e.only_bus, e.stem_mode = 0.3, only, True
+        e.buses[0].fx = []
+        e.trigger(0, 0.8)
+        e.trigger(1, 0.8)
+        return e.render(0.4)
+
+    full, s0, s1 = r(None), r(0), r(1)
+    assert float(np.abs(full - (s0 + s1)).max()) < 1e-5, "bus stems do not sum to the mix"
+    e = Engine(pr)
+    e.buses[0].mute = True
+    e.trigger(0, 1.0)
+    assert float(np.abs(e.render(0.1)).max()) < 1e-6, "muted bus is audible"
+    return "sidechain ducks %.0fx, bus stems sum to the mix, mute silences" % (free / max(ducked, 1e-9))
+
+
+def t_voice_modulation() -> str:
+    rng = np.random.default_rng(1)
+    pr = Project("n")
+    a = pr.add_asset(assetmod.asset_from_array(rng.normal(0, 0.3, (SR, 2)).astype(np.float32), "n"))
+    p = pr.pad(0)
+    p.asset_id, p.start, p.end, p.filter_kind, p.filter_cut = a.id, 0, a.frames, "lp", 500.0
+    pr.render_all()
+    e = Engine(pr)
+    e.master_gain = 1.0
+    e.trigger(0, 1.0)
+    y = e.render(0.8)
+    sp = np.abs(np.fft.rfft(dsp.mono(y))) ** 2
+    fr = np.fft.rfftfreq(len(y), 1.0 / SR)
+    ratio = sp[fr > 4000].sum() / sp[fr < 400].sum()
+    assert ratio < 0.01, "realtime lowpass leaves %.3f HF/LF" % ratio
+    outs = []
+    for block in (64, 256, 1000):
+        pr = _tone_project(3)
+        pr.pad(0).filter_kind, pr.pad(0).filter_cut, pr.pad(0).lfo_target, pr.pad(0).lfo_depth, pr.pad(0).lfo_rate = "lp", 800.0, "cutoff", 1.0, 3.0
+        pr.pad(1).lfo_target, pr.pad(1).lfo_depth, pr.pad(1).lfo_rate = "pitch", 0.5, 6.0
+        pr.pad(2).lfo_target, pr.pad(2).lfo_depth, pr.pad(2).lfo_rate = "pan", 1.0, 2.0
+        eng = Engine(pr, block=block)
+        for i in range(3):
+            eng.trigger(i, 1.0)
+        outs.append(eng.render(1.0, block))
+    d = max(float(np.abs(o - outs[0]).max()) for o in outs[1:])
+    assert d < 1e-5, "LFO voices differ across block sizes by %.2e" % d
+    # chromatic keys, bend, roll, protected voices, steal policy
+    pr = _tone_project(4)
+    e = Engine(pr)
+    e.set_pitch_bend(12.0)
+    e.trigger(0, 1.0)
+    y = e.render(0.5)
+    f = analysis.estimate_pitch(y[: SR // 2], SR)[0]
+    assert abs(f - 440.0) < 6.0, "bend +12 st gave %.1f Hz" % f
+    e = Engine(_tone_project(4))
+    e.roll(0, 16, 4)
+    e.render(1.2)
+    assert e.flash.get(0) is not None
+    pr = _tone_project(4)
+    pr.pad(0).protect = True
+    e = Engine(pr, max_voices=2)
+    for i in range(4):
+        e.trigger(i, 1.0)
+    e.render(0.02)
+    assert any(v.pad == 0 and not v.releasing for v in e.voices), "protected voice was stolen"
+    return "lowpass %.4f HF/LF, LFO cutoff/pitch/pan exact across blocks (%.1e), bend, roll, protect ok" % (ratio, d)
+
+
+def t_stems_loops_embed() -> str:
+    drums = demo.drum_break(92, 2)
+    chord = np.zeros_like(drums)
+    chord[: len(demo.chord())] = dsp.ensure_2d(demo.chord())
+    mix_ = dsp.ensure_2d(drums + chord)
+    parts = stems.separate_dsp(mix_, SR)
+    assert float(np.abs(sum(parts.values()) - mix_).max()) < 1e-3, "stems do not sum to the input"
+
+    def corr(a, b):
+        a, b = dsp.mono(a), dsp.mono(b)
+        return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-9))
+
+    c_d, c_o = corr(parts["drums"], drums), corr(parts["other"] + parts["bass"], chord)
+    assert c_d > 0.85 and c_o > 0.65, "separation quality drums %.2f chord %.2f" % (c_d, c_o)
+    bar = demo.drum_break(100, 2)[: int(4 * 60 / 100 * SR)]
+    sig = np.concatenate([np.zeros((int(0.3 * SR), 2), np.float32)] + [bar] * 4)
+    cands = loops.find_loops(sig, SR)
+    assert cands and abs(cands[0].length / SR - 2.4) < 0.03 and cands[0].bars == 1.0, cands[:1]
+    seam = loops.make_seamless(bar, 30, SR)
+    assert float(np.abs(seam[0] - seam[-1]).max()) < 0.01, "loop seam is not continuous"
+    k = analysis.embedding(demo.kick(), SR)
+    k2 = analysis.embedding(dsp.pitch_shift(dsp.ensure_2d(demo.kick()), -2), SR)
+    h = analysis.embedding(demo.hat(), SR)
+    assert analysis.similarity(k, k2) > analysis.similarity(k, h) + 0.2, "embedding does not rank a kick closer to a kick than to a hat"
+    return "stems sum exactly (drums r=%.2f, harmonic r=%.2f), 1 bar loop found, seam clean, embeddings rank timbre" % (c_d, c_o)
+
+
+def t_library() -> str:
+    import zipfile
+
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "Drums", "kicks"))
+        os.makedirs(os.path.join(d, "loops"))
+        w = lambda rel, x: assetmod.save_audio(os.path.join(d, rel), x, SR)
+        w("Drums/kicks/kick_deep.wav", demo.kick())
+        w("Drums/kicks/kick_deep_copy.wav", demo.kick())
+        w("Drums/kicks/kick_low.wav", dsp.pitch_shift(dsp.ensure_2d(demo.kick()), -2))
+        w("Drums/snare_tight.wav", demo.snare())
+        w("Drums/hat_closed.wav", demo.hat())
+        w("loops/break_92bpm_Cmaj.wav", demo.drum_break(92, 2, with_melody=True))
+        lib = library.Library(os.path.join(d, "lib.db"))
+        added, _ = lib.scan([d])
+        assert added == 6 and lib.scan([d]) == (0, 6), "scan/skip unchanged"
+        assert [r.name for r in lib.find("bpm:85-100")] == ["break_92bpm_Cmaj"]
+        assert {r.name for r in lib.find("tag:kick")} == {"kick_deep", "kick_deep_copy", "kick_low"}
+        k = lib.search("kick_deep")[0]
+        lib.add_tag(k.id, "punchy")
+        lib.set_rating(k.id, 5)
+        lib.set_favorite(k.id)
+        assert [r.name for r in lib.find("fav rating:4 tag:punchy")] == ["kick_deep"]
+        sim = lib.similar(k.id, 3)
+        assert sim[0].name == "kick_deep_copy" and sim[1].name == "kick_low", [r.name for r in sim]
+        assert [[r.name for r in g] for g in lib.duplicates()] == [["kick_deep", "kick_deep_copy"]]
+        evil = os.path.join(d, "evil.zip")
+        with zipfile.ZipFile(evil, "w") as zf:
+            zf.writestr("../evil.wav", b"x")
+        try:
+            lib.import_pack(evil, os.path.join(d, "evil_out"))
+            raise AssertionError("zip slip not blocked")
+        except ValueError:
+            pass
+        assert not os.path.exists(os.path.join(d, "evil.wav"))
+        good = os.path.join(d, "good.zip")
+        with zipfile.ZipFile(good, "w") as zf:
+            zf.write(os.path.join(d, "Drums", "snare_tight.wav"), "Pack/Snares/snare_a.wav")
+        dest, n = lib.import_pack(good, os.path.join(d, "pack_out"))
+        assert n == 1 and "snare" in lib.find("snare_a")[0].tags
+        lib.close()
+    return "scan, filters, tags, rating, similarity, duplicates, zip-slip blocked, pack import tagged"
+
+
+def t_midi() -> str:
+    from types import SimpleNamespace as NS
+
+    with tempfile.TemporaryDirectory() as d:
+        pr = _tone_project(4)
+        e = Engine(pr)
+        r = midi.MidiRouter(e, midi.MidiMap(path=os.path.join(d, "m.json")))
+        r.handle(NS(type="note_on", note=36, velocity=100))
+        e.render(0.02)
+        assert e.voice_count == 1, "note did not trigger its pad"
+        r.handle(NS(type="control_change", control=7, value=127))
+        assert abs(e.master_gain - 1.2) < 1e-6
+        e.selected_pad = 2
+        r.handle(NS(type="control_change", control=16, value=127))
+        assert abs(pr.pad(2).gain_db - 6.0) < 1e-6
+        r.handle(NS(type="program_change", program=2))
+        assert e.active_bank == 2
+        r.learn("bus1.gain")
+        r.handle(NS(type="control_change", control=50, value=0))
+        r.handle(NS(type="control_change", control=50, value=127))
+        assert abs(e.buses[0].gain - 1.5) < 1e-6, "learned CC did not apply"
+        r.learn("transport.toggle")
+        r.handle(NS(type="note_on", note=99, velocity=90))
+        r.handle(NS(type="note_on", note=99, velocity=90))
+        e.render(0.01)
+        assert e.playing, "learned transport note failed"
+        t = [0.0]
+        f = midi.ClockFollower(e, now=lambda: t[0])
+        r.follower = f
+        r.handle(NS(type="start"))
+        for _ in range(60):
+            t[0] += 60 / 100 / 24
+            r.handle(NS(type="clock"))
+        e.render(0.01)
+        assert abs(e.sched.bpm - 100.0) < 0.2, "clock follow bpm %.2f" % e.sched.bpm
+        pr2 = _tone_project(1)
+        pr2.bpm = 120
+        e2 = Engine(pr2)
+        e2.clock_out = True
+        e2.sync_from_project()
+        e2.play()
+        e2.render(2.0)
+        n = 0
+        while not e2.clock_q.empty():
+            n += e2.clock_q.get() == "clock"
+        assert abs(n - 96) <= 1, "clock out pulses %d" % n
+
+        class Port:
+            def close(self):
+                pass
+
+        class Fake:
+            names = ["A"]
+
+            def get_input_names(self):
+                return list(self.names)
+
+            def get_output_names(self):
+                return ["Out"]
+
+            def open_input(self, name, callback=None):
+                return Port()
+
+        fb, evs = Fake(), []
+        m = midi.MidiManager(e, backend=fb, on_event=evs.append, poll_s=0.05)
+        m.start()
+        fb.names = ["A", "B"]
+        time.sleep(0.25)
+        assert set(m.status()["inputs"]) == {"A", "B"}
+        fb.names = ["B"]
+        time.sleep(0.25)
+        assert m.status()["inputs"] == ["B"] and any("disconnected" in x for x in evs)
+        m.stop()
+    return "notes, CC, learn, program change, clock in (100 bpm), clock out (96 pulses), hot-plug survive unplug"
+
+
+def t_providers_taste() -> str:
+    bad = providers.validate_plan({"kit": {"pads": 999, "mode": "rm -rf", "ops": ["reverse", "os.system"], "evil": 1},
+                                   "pattern": {"count": 99, "style": "x"}, "bpm": 1e9, "path": "/etc/passwd"})
+    assert bad["kit"] == {"pads": 16, "ops": ["reverse"]} and bad["bpm"] == 300.0 and "path" not in bad and bad["pattern"]["count"] == 8
+    with tempfile.TemporaryDirectory() as d:
+        script = os.path.join(d, "p.py")
+        with open(script, "w") as fh:
+            fh.write("import sys,json\njson.load(sys.stdin)\nprint(json.dumps({'kit':{'pads':6},'pattern':{'count':1,'bars':1,'style':'euclid'},'bpm':101}))")
+        import sys as _sys
+
+        plan = providers.plan_from_prompt("x", "command:%s %s" % (_sys.executable, script))
+        assert plan["kit"]["pads"] == 6 and plan["bpm"] == 101.0 and plan["pattern"]["style"] == "euclid"
+        try:
+            providers.get("python:os:getcwd")
+            raise AssertionError("python provider allowed without opt-in")
+        except PermissionError:
+            pass
+        t = taste.Taste(path=os.path.join(d, "taste.json"))
+        ops = ["reverse", "crush", "stutter"]
+        assert np.allclose(t.preference("op:", ops), 1 / 3)
+        for _ in range(6):
+            t.record([{"op:reverse": 1.0}], True)
+            t.record([{"op:crush": 1.0}], False)
+        p = t.preference("op:", ops)
+        assert p[0] > 0.5 and p[1] < 0.2, p
+        assert taste.Taste(path=os.path.join(d, "taste.json")).n == 12, "taste not persisted"
+        pr = Project("t")
+        a = pr.add_asset(assetmod.asset_from_array(demo.drum_break(92, 2), "b"))
+        base = creative.generate_kit(pr, a, creative.KitParams(seed=5, experimental=1.0))
+        assert base.chosen == 16
+        k2 = creative.generate_kit(pr, a, creative.KitParams(seed=5, experimental=1.0, taste=True), taste_model=t)
+        ops_used = [o["op"] for pd in pr.banks[0].pads for o in pd.recipe.ops]
+        assert "crush" not in ops_used or ops_used.count("reverse") >= ops_used.count("crush"), ops_used
+    return "plans validated and clamped, command provider works, python provider gated, taste learns and persists"
+
+
+def t_loudness_busstems() -> str:
+    x = demo.drum_break(92, 2, with_melody=True)
+    g = analysis.loudness_integrated(x, SR)
+    assert -40 < g < -5 and abs(g - analysis.loudness_lufs(x, SR)) < 1.0
+    tone = np.concatenate([demo.tone(220, 3.0)] * 1)
+    y, info = dsp.normalize_lufs(dsp.ensure_2d(tone), SR, -20.0, -1.0)
+    assert abs(info["after"] + 20.0) < 0.3 and info["true_peak_db"] <= -0.99, info
+    pr = _project_with_kit()
+    for i, p in enumerate(pr.banks[0].pads):
+        p.bus = i % 2
+    e = Engine(pr)
+    e.buses[1].fx = [fxmod.make_fx("eq", SR, high_db=-6)]
+    e.commit_settings()
+    with tempfile.TemporaryDirectory() as d:
+        files = export.export_bus_stems(pr, d)
+        assert len(files) == 2
+        stem_sum = sum(assetmod.read_audio(f)[0][: 100000] for f in files)
+        ref = Engine(pr)
+        ref.stem_mode = True
+        ref.play()
+        ref_audio = ref.render(len(stem_sum) / SR + 0.1)[: len(stem_sum)]
+        assert float(np.abs(stem_sum - ref_audio).max()) < 1e-4, "bus stems with effects do not sum to the mix"
+    z = export.render_pattern(pr, None, 1, lufs=-18.0)
+    return "gated LUFS %.1f, normalise hits %.1f LUFS under a -1 dB true-peak ceiling, bus stems with fx sum to the mix" % (g, info["after"])
+
+
+def t_robustness() -> str:
+    pr = _project_with_kit()
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "p")
+        pr.save(path)
+        pr.autosave()
+        time.sleep(1.05)
+        pr.autosave()
+        assert len(Project.autosaves(path)) >= 2
+        with open(os.path.join(path, "project.json"), "w") as fh:
+            fh.write("{broken")
+        from .project import ProjectError
+
+        try:
+            Project.load(path)
+            raise AssertionError("corrupt project loaded")
+        except ProjectError:
+            pass
+        rec = Project.recover(path)
+        assert len(rec.assets) == 1 and len(rec.pattern.events) == len(pr.pattern.events)
+        try:
+            Project.load(os.path.join(d, "missing"))
+            raise AssertionError("missing project loaded")
+        except ProjectError:
+            pass
+        rec.song_add(rec.current_pattern, 2)
+        assert rec.song_seconds() > 5
+    e = Engine(_tone_project(2))
+    e.trigger(0, 1.0)
+    e.render(0.1)
+    dg = e.diagnostics()
+    assert dg["voices"] == 1 and dg["sample_memory_mb"] > 0 and dg["device_state"] == "running"
+    return "corrupt project reported cleanly, newest autosave recovered, song chain ok, diagnostics report"
+
+
+def t_optional_backends() -> str:
+    got = []
+    if dsp.rubberband_available():
+        dsp.set_stretch_backend("rubberband")
+        try:
+            x = dsp.ensure_2d(demo.tone(440.0, 2.0))
+            y, z = dsp.time_stretch(x, 1.5), dsp.pitch_shift(x, 7.0)
+            assert abs(len(y) / len(x) - 1.5) < 0.01 and len(z) == len(x)
+            f = analysis.estimate_pitch(z, SR)[0]
+            assert abs(f / (440 * 2 ** (7 / 12)) - 1) < 0.01, f
+            got.append("rubberband")
+        finally:
+            dsp.set_stretch_backend("wsola")
+    try:
+        import aubio  # noqa: F401
+
+        analysis.set_onset_backend("aubio")
+        try:
+            b = demo.drum_break(92, 2)
+            pos, _ = analysis.detect_onsets(b, SR, 0.5)
+            assert 14 <= len(pos) <= 26
+            got.append("aubio")
+        finally:
+            analysis.set_onset_backend("builtin")
+    except ImportError:
+        pass
+    try:
+        import pedalboard  # noqa: F401
+
+        f = fxmod.make_fx("pedalboard", SR, plugin="Reverb", params='{"room_size": 0.6}')
+        y = f.process(demo.drum_break(92, 1)[:8192])
+        assert y.shape == (8192, 2) and np.isfinite(y).all()
+        got.append("pedalboard")
+    except ImportError:
+        pass
+    if not got:
+        raise Skip("none of rubberband, aubio, pedalboard installed")
+    return "verified: " + ", ".join(got)
+
+
+def t_soak() -> str:
+    import io
+    from contextlib import redirect_stdout
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = soak(8.0, seed=3, verbose=True)
+    assert rc == 0, buf.getvalue()
+    return buf.getvalue().strip().replace("soak ", "")[:110]
+
+
+CHECKS += [
+    ("effects rack", t_fx_rack),
+    ("buses and sidechain", t_buses_sidechain),
+    ("voice filter, lfo, bend", t_voice_modulation),
+    ("stems, loops, embeddings", t_stems_loops_embed),
+    ("library and packs", t_library),
+    ("midi, learn, clock", t_midi),
+    ("plan providers and taste", t_providers_taste),
+    ("loudness and bus stems", t_loudness_busstems),
+    ("recovery and diagnostics", t_robustness),
+    ("optional backends", t_optional_backends),
+    ("soak", t_soak),
+]
+
+
 def run(verbose: bool = True) -> int:
-    fails = 0
+    fails = skips = 0
     t_all = time.time()
     for name, fn in CHECKS:
         t0 = time.time()
+        skipped = False
         try:
             detail = fn()
             ok = True
+        except Skip as exc:
+            detail, ok, skipped = str(exc), True, True
         except Exception as exc:  # noqa: BLE001 - report every failure, keep going
             detail, ok = "%s: %s" % (exc.__class__.__name__, exc), False
         fails += 0 if ok else 1
+        skips += 1 if skipped else 0
         if verbose:
-            print("  %-4s %-30s %5.2fs  %s" % ("PASS" if ok else "FAIL", name, time.time() - t0, detail))
-    print("\n%d/%d checks passed in %.1fs" % (len(CHECKS) - fails, len(CHECKS), time.time() - t_all))
+            print("  %-4s %-30s %5.2fs  %s" % ("SKIP" if skipped else ("PASS" if ok else "FAIL"), name, time.time() - t0, detail))
+    print("\n%d/%d checks passed (%d skipped) in %.1fs" % (len(CHECKS) - fails - skips, len(CHECKS), skips, time.time() - t_all))
     return 1 if fails else 0
+
+
+def _rss_mb() -> float:
+    try:
+        with open("/proc/self/statm") as fh:
+            return int(fh.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") / 1e6
+    except (OSError, ValueError):
+        return 0.0
+
+
+def soak(seconds: float = 20.0, seed: int = 1, verbose: bool = True) -> int:
+    """Stress the engine: random triggers, rolls, pitch bend, tempo and pattern changes, effects on every bus.
+    Fails on NaN/inf, clipping past full scale, runaway voices, or memory growth."""
+    rng = np.random.default_rng(seed)
+    pr = _project_with_kit(seed=seed)
+    pr.render_all()
+    e = Engine(pr, block=256, seed=seed)
+    from .fx import make_fx
+
+    for i, p in enumerate(pr.banks[0].pads):
+        p.bus = i % 4
+        p.send_a, p.send_b = float(rng.random() < 0.4) * 0.2, float(rng.random() < 0.4) * 0.3
+        if i % 5 == 0:
+            p.lfo_target, p.lfo_depth, p.lfo_rate = "cutoff", 1.0, 2.0
+            p.filter_kind, p.filter_cut = "lp", 3000.0
+    e.buses[1].fx = [make_fx("compressor", SR, threshold_db=-30, ratio=6)]
+    e.buses[1].sidechain = 0
+    e.buses[2].fx = [make_fx("chorus", SR), make_fx("phaser", SR)]
+    e.master_fx = [make_fx("eq", SR, high_db=-2), make_fx("tape", SR)]
+    e.play()
+    t_end = int(seconds * SR)
+    names = list(pr.patterns)
+    start_rss = _rss_mb()
+    bad = []
+    peak = 0.0
+    maxv = 0
+    t0 = time.time()
+    next_event = 0
+    while e.frame < t_end:
+        if e.frame >= next_event:
+            for _ in range(int(rng.integers(1, 4))):
+                e.trigger(int(rng.integers(0, 16)), float(rng.uniform(0.2, 1.0)))
+            r = rng.random()
+            if r < 0.05:
+                e.roll(int(rng.integers(0, 16)), 16, 6)
+            elif r < 0.10:
+                e.set_pitch_bend(float(rng.uniform(-2, 2)))
+            elif r < 0.15:
+                e.set_bpm(float(rng.uniform(70, 160)))
+            elif r < 0.18:
+                e.set_pattern(names[int(rng.integers(0, len(names)))])
+            elif r < 0.20:
+                e.stop_all()
+            next_event = e.frame + int(rng.integers(500, 6000))
+        y = e.render_block(int(rng.choice([64, 128, 256, 512])))
+        if not np.isfinite(y).all():
+            bad.append("non-finite output at frame %d" % e.frame)
+            break
+        peak = max(peak, float(np.abs(y).max()))
+        maxv = max(maxv, e.voice_count)
+    wall = time.time() - t0
+    grew = _rss_mb() - start_rss
+    if peak >= 1.0:
+        bad.append("output reached full scale (%.4f)" % peak)
+    if maxv > e.max_voices * 2 + 1:
+        bad.append("voice count ran away (%d)" % maxv)
+    if grew > 80:
+        bad.append("memory grew %.0f MB" % grew)
+    if len(e.live) > 200:
+        bad.append("live trigger queue grew to %d" % len(e.live))
+    if verbose:
+        print("soak %.0fs of audio in %.1fs wall (%.1fx real time): peak %.3f, max voices %d, memory %+.1f MB -> %s" % (
+            seconds, wall, seconds / max(wall, 1e-6), peak, maxv, grew, "FAIL: " + "; ".join(bad) if bad else "PASS"))
+    return 1 if bad else 0

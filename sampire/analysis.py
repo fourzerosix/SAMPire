@@ -77,9 +77,45 @@ def _refine_onset(m: np.ndarray, centre: int, sr: int) -> int:
     return int(lo + int(np.argmax(score)))
 
 
+ONSET_BACKEND = "builtin"        # builtin | aubio (pip install aubio-ledfx)
+
+
+def set_onset_backend(name: str) -> None:
+    global ONSET_BACKEND
+    if name not in ("builtin", "aubio"):
+        raise ValueError("onset backend must be 'builtin' or 'aubio'")
+    if name == "aubio":
+        try:
+            import aubio  # noqa: F401
+        except Exception as exc:
+            raise RuntimeError("aubio is not installed (pip install aubio-ledfx)") from exc
+    ONSET_BACKEND = name
+
+
+def _aubio_onsets(x: np.ndarray, sr: int, sensitivity: float, min_gap_ms: float):
+    import aubio
+
+    m = dsp.mono(x).astype(np.float32)
+    hop = 256
+    o = aubio.onset("default", 1024, hop, sr)
+    o.set_threshold(float(0.9 - 0.8 * np.clip(sensitivity, 0, 1)))
+    o.set_silence(-60.0)
+    o.set_minioi_ms(float(min_gap_ms))
+    pos = []
+    for i in range(0, len(m), hop):
+        frame = m[i:i + hop]
+        if len(frame) < hop:
+            frame = np.pad(frame, (0, hop - len(frame)))
+        if o(frame):
+            pos.append(int(o.get_last()))
+    return np.array(pos, dtype=np.int64), np.ones(len(pos), dtype=np.float32)
+
+
 def detect_onsets(x: np.ndarray, sr: int, sensitivity: float = 0.5, min_gap_ms: float = 35.0,
                   band: Optional[Tuple[float, float]] = None) -> Tuple[np.ndarray, np.ndarray]:
     """Return (onset sample positions, strengths 0..1). sensitivity 0 = only big hits, 1 = everything."""
+    if ONSET_BACKEND == "aubio" and band is None:
+        return _aubio_onsets(x, sr, sensitivity, min_gap_ms)
     m = dsp.mono(x)
     env = onset_envelope(x, sr, band)
     if len(env) < 4 or env.max() <= 0:
@@ -345,3 +381,90 @@ def analyze(x: np.ndarray, sr: int, sensitivity: float = 0.5) -> Dict[str, objec
         "key_confidence": float(kconf),
         "percussive_ratio": percussive_ratio(x) if len(x) > 4096 else 0.5,
     }
+
+
+# ----------------------------------------------------------------------------- embeddings (similarity search)
+def _mel_filterbank(sr: int, n_fft: int, n_mels: int = 24, fmin: float = 40.0, fmax: float = 16000.0) -> np.ndarray:
+    def hz2mel(f):
+        return 2595.0 * np.log10(1.0 + f / 700.0)
+
+    def mel2hz(m):
+        return 700.0 * (10.0 ** (m / 2595.0) - 1.0)
+
+    pts = mel2hz(np.linspace(hz2mel(fmin), hz2mel(min(fmax, sr / 2.0)), n_mels + 2))
+    freqs = np.fft.rfftfreq(n_fft, 1.0 / sr)
+    fb = np.zeros((n_mels, len(freqs)), dtype=np.float32)
+    for i in range(n_mels):
+        lo, ce, hi = pts[i], pts[i + 1], pts[i + 2]
+        up = (freqs - lo) / max(ce - lo, 1e-9)
+        down = (hi - freqs) / max(hi - ce, 1e-9)
+        fb[i] = np.maximum(0.0, np.minimum(up, down))
+    return fb
+
+
+def embedding(x: np.ndarray, sr: int) -> np.ndarray:
+    """A compact timbre-and-shape vector (float32, 60 values) for similarity search. Loudness independent.
+
+    Layout: 24 mean log-mel bands (spectral shape), 24 log-mel standard deviations (movement), 12 scalars
+    (centroid, rolloff-ish low/high energy, flatness, zcr, decay, duration, pitch clarity, percussive ratio...)."""
+    x = dsp.ensure_2d(x)
+    m = dsp.mono(x)
+    if len(m) < 256:
+        return np.zeros(60, dtype=np.float32)
+    if len(m) > 10 * sr:                                          # judge the loudest ten seconds
+        e = uniform_filter1d(np.abs(m), sr)
+        c = int(np.argmax(e))
+        a = int(np.clip(c - 5 * sr, 0, len(m) - 10 * sr))
+        m = m[a:a + 10 * sr]
+    n_fft, hop = 1024, 512
+    mag = stft_mag(m, n_fft, hop)
+    fb = _mel_filterbank(sr, n_fft)
+    mel = np.log10(fb @ (mag ** 2) + 1e-10)                       # (24, frames)
+    shape = mel.mean(axis=1)
+    shape = shape - shape.mean()                                  # remove loudness
+    move = mel.std(axis=1)
+    f = describe_hit(m[: int(0.5 * sr)], sr)
+    scal = np.array([
+        np.log10(f["centroid"] + 50.0) / 4.3, f["low"], f["high"], min(f["flat"] * 2.0, 1.0), f["zcr"] * 4.0,
+        min(f["decay"], 1.0), min(np.log10(len(m) / sr + 0.01) / 2.0 + 0.5, 1.5), f["clarity"],
+        (percussive_ratio(m) if len(m) > 4096 else 0.5), min(max(f["f0"], 1.0), 2000.0) / 2000.0, f["flat"], f["peak"],
+    ], dtype=np.float32)
+    v = np.concatenate([shape / 3.0, move / 2.0, scal * 1.5]).astype(np.float32)
+    return v
+
+
+def cosine(a: np.ndarray, b: np.ndarray) -> float:
+    na, nb = float(np.linalg.norm(a)), float(np.linalg.norm(b))
+    return float(np.dot(a, b) / (na * nb)) if na > 1e-9 and nb > 1e-9 else 0.0
+
+
+def similarity(a: np.ndarray, b: np.ndarray) -> float:
+    """1.0 = identical timbre, falling toward 0 as the embeddings move apart (distance based, not just angle)."""
+    d = float(np.linalg.norm(a - b)) / (0.5 * (float(np.linalg.norm(a)) + float(np.linalg.norm(b))) + 1e-6)
+    return float(1.0 / (1.0 + d * d))
+
+
+def loudness_integrated(x: np.ndarray, sr: int) -> float:
+    """ITU-R BS.1770-4 gated integrated loudness in LUFS (400 ms blocks, 75 % overlap, -70 LUFS absolute gate,
+    -10 LU relative gate). Resamples to 48 kHz first if needed."""
+    y = dsp.ensure_2d(x)
+    if sr != 48000:
+        y = dsp.resample_sr(y, sr, 48000)
+    y = lfilter(*_K2, lfilter(*_K1, y.astype(np.float64), axis=0), axis=0)
+    blk, step = 19200, 4800
+    if len(y) < blk:
+        ms = np.mean(y ** 2, axis=0).sum()
+        return float(-0.691 + 10.0 * np.log10(ms + 1e-12))
+    sq = y ** 2
+    cs = np.vstack([np.zeros((1, 2)), np.cumsum(sq, axis=0)])
+    starts = np.arange(0, len(y) - blk + 1, step)
+    ms = ((cs[starts + blk] - cs[starts]) / blk).sum(axis=1)
+    lk = -0.691 + 10.0 * np.log10(ms + 1e-12)
+    keep = lk > -70.0
+    if not keep.any():
+        return float("-inf")
+    rel = -0.691 + 10.0 * np.log10(ms[keep].mean() + 1e-12) - 10.0
+    keep &= lk > rel
+    if not keep.any():
+        return float("-inf")
+    return float(-0.691 + 10.0 * np.log10(ms[keep].mean() + 1e-12))

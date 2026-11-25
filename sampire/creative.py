@@ -36,6 +36,7 @@ class KitParams:
     seed: int = 1
     tail_ms: Optional[float] = 600.0     # a chop ends at the next hit or after this long
     ops: Optional[List[str]] = None      # restrict the transform vocabulary (None = all sensible ones)
+    taste: bool = False                  # bias choices toward what you kept before (see taste.py)
 
 
 @dataclass
@@ -70,7 +71,12 @@ def _vector(feat: dict) -> np.ndarray:
     return np.array([np.log10(feat["centroid"] + 50) / 4.3, feat["low"], feat["high"], min(feat["decay"], 1.0), feat["flat"] * 2, min(feat["dur"], 1.0)])
 
 
-def select_slices(asset: AudioAsset, slices: List[Slice], p: KitParams, rng: np.random.Generator) -> List[Tuple[Slice, dict]]:
+def _slice_feats(label: str, feat: dict) -> Dict[str, float]:
+    return {"label:" + (label or "?"): 1.0, "len:" + ("short" if feat["dur"] < 0.25 else "long"): 1.0,
+            "kind:" + ("percussive" if feat["decay"] < 0.35 and feat["clarity"] < 0.8 else "tonal"): 1.0}
+
+
+def select_slices(asset: AudioAsset, slices: List[Slice], p: KitParams, rng: np.random.Generator, tm=None) -> List[Tuple[Slice, dict]]:
     """Pick N slices that are loud enough, suit the preferences, and differ from one another (farthest-point sampling)."""
     cand = []
     for sl in slices:
@@ -81,6 +87,8 @@ def select_slices(asset: AudioAsset, slices: List[Slice], p: KitParams, rng: np.
         sc = _score(sl, feat, p)
         if sc > 0:
             sl.label = analysis.classify_sample(x[: int(0.5 * asset.sr)], asset.sr)
+            if tm is not None and tm.n > 0:
+                sc += 0.5 * tm.score(_slice_feats(sl.label, feat))
             cand.append((sc, sl, feat))
     if not cand:
         return []
@@ -133,16 +141,40 @@ _SAFE_FOR_DRUMS = ["reverse", "pitch_down", "pitch_up", "crush", "drive", "lowpa
 _SAFE_FOR_LONG = list(_TRANSFORMS)
 
 
-def random_recipe(rng: np.random.Generator, label: str, vocabulary: Optional[List[str]] = None, depth: int = 1) -> Recipe:
+def random_recipe(rng: np.random.Generator, label: str, vocabulary: Optional[List[str]] = None, depth: int = 1, tm=None) -> Recipe:
     vocab = vocabulary or (_SAFE_FOR_DRUMS if label in ("kick", "snare", "hat", "open_hat", "perc") else _SAFE_FOR_LONG)
     r = Recipe(seed=int(rng.integers(0, 2 ** 31 - 1)))
-    for name in rng.choice(vocab, size=min(depth, len(vocab)), replace=False):
+    prob = tm.preference("op:", list(vocab)) if (tm is not None and tm.n > 0) else None
+    for name in rng.choice(vocab, size=min(depth, len(vocab)), replace=False, p=prob):
         _TRANSFORMS[str(name)](r, rng)
     return r
 
 
 # ----------------------------------------------------------------------------- kit generation
-def generate_kit(project: Project, asset: AudioAsset, params: Optional[KitParams] = None, slices: Optional[List[Slice]] = None) -> KitReport:
+def kit_features(project: Project, bank: int = 0) -> List[Dict[str, float]]:
+    """Feature dicts for every filled pad in a bank, in the form Taste learns from."""
+    out = []
+    for pad in project.banks[bank % len(project.banks)].pads:
+        if pad.empty:
+            continue
+        f = {"label:" + (pad.label or "?"): 1.0}
+        a = project.assets.get(pad.asset_id)
+        if a is not None:
+            f.update(_slice_feats(pad.label, analysis.describe_hit(a.region(pad.start, pad.end)[: 24000], a.sr)))
+        for o in pad.recipe.ops:
+            f["op:" + str(o["op"])] = 1.0
+        if pad.reverse:
+            f["op:reverse"] = 1.0
+        out.append(f)
+    return out
+
+
+def pattern_features(style: str, density: float) -> Dict[str, float]:
+    return {"style:" + style: 1.0, "density:" + ("busy" if density > 0.6 else "sparse" if density < 0.35 else "mid"): 1.0}
+
+
+def generate_kit(project: Project, asset: AudioAsset, params: Optional[KitParams] = None, slices: Optional[List[Slice]] = None,
+                 taste_model=None) -> KitReport:
     """Analyse, chop, choose, transform and assign: one asset in, one populated bank out."""
     p = params or KitParams()
     rng = np.random.default_rng(p.seed)
@@ -153,7 +185,8 @@ def generate_kit(project: Project, asset: AudioAsset, params: Optional[KitParams
         slices = make_slices(p.mode, asset.data, asset.sr, count=p.pads, sensitivity=p.sensitivity, bpm=bpm, tail_ms=p.tail_ms) \
             if p.mode in ("transient", "hybrid") else make_slices(p.mode, asset.data, asset.sr, count=p.pads, bpm=bpm)
     rep = KitReport(asset.name, len(slices), 0)
-    picks = select_slices(asset, slices, p, rng)
+    tm = taste_model if p.taste else None
+    picks = select_slices(asset, slices, p, rng, tm)
     if not picks:
         rep.notes.append("nothing usable found; try a higher sensitivity")
         return rep
@@ -177,7 +210,7 @@ def generate_kit(project: Project, asset: AudioAsset, params: Optional[KitParams
         if sl.label == "tone":
             pad.attack = 0.002
         if i not in keep_ids and rng.random() < p.experimental * 1.5 and p.experimental > 0:
-            pad.recipe = random_recipe(rng, sl.label, p.ops, depth=1 + int(rng.random() < p.experimental * 0.5))
+            pad.recipe = random_recipe(rng, sl.label, p.ops, depth=1 + int(rng.random() < p.experimental * 0.5), tm=tm)
             rep.transformed += 1
         rep.labels[sl.label or "?"] = rep.labels.get(sl.label or "?", 0) + 1
     for i in range(len(picks), PADS_PER_BANK):
@@ -201,11 +234,15 @@ def _pads_by_label(project: Project, bank: int) -> Dict[str, List[Pad]]:
 
 
 def generate_pattern(project: Project, bank: int = 0, bars: int = 2, style: str = "break", density: float = 0.5,
-                     consistency: float = 0.7, swing: float = 0.0, seed: int = 1, name: Optional[str] = None) -> Pattern:
+                     consistency: float = 0.7, swing: float = 0.0, seed: int = 1, name: Optional[str] = None, taste_model=None) -> Pattern:
     """Build a pattern from the pads in a bank. `consistency` is how much bar 1 repeats in later bars."""
     rng = np.random.default_rng(seed)
+    if style == "auto":
+        prob = taste_model.preference("style:", list(STYLES)) if (taste_model is not None and taste_model.n > 0) else None
+        style = str(rng.choice(list(STYLES), p=prob))
     pat = Pattern(name or "G%d" % (len(project.patterns) + 1), bars)
     pat.swing = swing
+    pat.style = style
     lab = _pads_by_label(project, bank)
     allp = [p for ps in lab.values() for p in ps]
     if not allp:
@@ -417,13 +454,33 @@ def parse_instruction(text: str) -> dict:
     return plan
 
 
-def run_plan(project: Project, asset: AudioAsset, plan: dict, seed: int = 1, bank: int = 0) -> Tuple[KitReport, List[Pattern]]:
-    kp = KitParams(seed=seed, bank=bank, **plan.get("kit", {}))
+def assign_slices(project: Project, asset: AudioAsset, slices: List[Slice], bank: int = 0) -> KitReport:
+    """Put slices on pads in time order (classic MPC chop layout): slice 1 on pad 1, slice 2 on pad 2, and so on."""
+    b = project.banks[bank % len(project.banks)]
+    rep = KitReport(asset.name, len(slices), 0)
+    for i, pad in enumerate(b.pads):
+        if i < len(slices):
+            sl = slices[i]
+            pad.clear()
+            pad.asset_id, pad.start, pad.end = asset.id, int(sl.start), int(sl.end)
+            pad.label = analysis.classify_sample(asset.data[sl.start:sl.end][: asset.sr // 2], asset.sr)
+            pad.name = "ch%d" % (i + 1)
+            rep.labels[pad.label] = rep.labels.get(pad.label, 0) + 1
+            rep.chosen += 1
+        else:
+            pad.clear()
+    project.render_all()
+    project.dirty = True
+    return rep
+
+
+def run_plan(project: Project, asset: AudioAsset, plan: dict, seed: int = 1, bank: int = 0, taste_model=None) -> Tuple[KitReport, List[Pattern]]:
+    kp = KitParams(seed=seed, bank=bank, taste=taste_model is not None, **plan.get("kit", {}))
     rep = KitReport(asset.name, 0, 0)
     pats: List[Pattern] = []
     project.checkpoint()
     if plan.get("kit") is not None and (plan.get("kit") or plan.get("pattern") is None):
-        rep = generate_kit(project, asset, kp)
+        rep = generate_kit(project, asset, kp, taste_model=taste_model)
     if plan.get("bpm"):
         project.bpm = plan["bpm"]
     if "swing" in plan:
@@ -431,7 +488,7 @@ def run_plan(project: Project, asset: AudioAsset, plan: dict, seed: int = 1, ban
     spec = plan.get("pattern")
     if spec:
         for i in range(spec["count"]):
-            pt = generate_pattern(project, bank, spec["bars"], spec["style"], spec["density"], 0.7, plan.get("swing", 0.0), seed + i)
+            pt = generate_pattern(project, bank, spec["bars"], spec["style"], spec["density"], 0.7, plan.get("swing", 0.0), seed + i, taste_model=taste_model)
             project.patterns[pt.name] = pt
             pats.append(pt)
         if pats:

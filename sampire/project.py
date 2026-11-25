@@ -26,6 +26,11 @@ from .pad import Bank, Pad, make_banks
 from .sequencer import Pattern
 
 FORMAT = 1
+AUTOSAVE_KEEP = 5
+
+
+class ProjectError(Exception):
+    """A project folder is missing, corrupt or from an incompatible version. The message is safe to show the user."""
 
 
 class Project:
@@ -43,6 +48,8 @@ class Project:
         self.song: List[Tuple[str, int]] = []
         self.mode = "pattern"
         self.fx_settings: dict = {}
+        self.midi_map: dict = {}               # project level MIDI mapping (overrides the global one)
+        self.tags: dict = {}
         self._undo: List[str] = []
         self._redo: List[str] = []
         self.dirty = False
@@ -103,7 +110,7 @@ class Project:
         return {
             "format": FORMAT, "name": self.name, "sr": self.sr, "bpm": self.bpm, "swing": self.swing, "seed": self.seed,
             "mode": self.mode, "current_pattern": self.current_pattern, "song": [[n, r] for n, r in self.song],
-            "fx": self.fx_settings, "banks": [b.to_dict() for b in self.banks],
+            "fx": self.fx_settings, "midi_map": self.midi_map, "banks": [b.to_dict() for b in self.banks],
             "patterns": {k: v.to_dict() for k, v in self.patterns.items()},
         }
 
@@ -116,6 +123,7 @@ class Project:
         self.current_pattern = m.get("current_pattern", "P1")
         self.song = [(n, int(r)) for n, r in m.get("song", [])]
         self.fx_settings = m.get("fx", {})
+        self.midi_map = m.get("midi_map", {})
         self.banks = [Bank.from_dict(b) for b in m.get("banks", [])] or make_banks(NUM_BANKS)
         self.patterns = {k: Pattern.from_dict(v) for k, v in m.get("patterns", {}).items()} or {"P1": Pattern("P1", 1)}
         self.render_all()
@@ -152,46 +160,108 @@ class Project:
             json.dump(m, fh, indent=1)
         os.replace(tmp, os.path.join(path, "project.json"))
         self.path, self.dirty = path, False
+        self.autosave()
         return path
 
     def autosave(self) -> Optional[str]:
+        """Write a timestamped snapshot of the model (not audio) and keep the newest few."""
         if not self.path:
             return None
-        snap = os.path.join(self.path, "autosave", "project-%d.json" % (int(time.time()) % 3))
+        d = os.path.join(self.path, "autosave")
         try:
-            with open(snap, "w", encoding="utf-8") as fh:
+            os.makedirs(d, exist_ok=True)
+            snap = os.path.join(d, "project-%s.json" % time.strftime("%Y%m%d-%H%M%S"))
+            tmp = snap + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
                 json.dump(self._model(), fh)
+            os.replace(tmp, snap)
+            old = sorted(f for f in os.listdir(d) if f.startswith("project-") and f.endswith(".json"))[:-AUTOSAVE_KEEP]
+            for f in old:
+                os.remove(os.path.join(d, f))
             return snap
         except OSError:
             return None
 
     @staticmethod
-    def load(path: str) -> "Project":
+    def autosaves(path: str) -> List[str]:
+        d = os.path.join(os.path.abspath(path), "autosave")
+        try:
+            return sorted((os.path.join(d, f) for f in os.listdir(d) if f.startswith("project-") and f.endswith(".json")), reverse=True)
+        except OSError:
+            return []
+
+    @staticmethod
+    def recover(path: str) -> "Project":
+        """Open the newest readable autosave of a project (after a crash or a corrupted project.json)."""
+        for snap in Project.autosaves(path):
+            try:
+                return Project.load(path, model_file=snap)
+            except ProjectError:
+                continue
+        raise ProjectError("no usable autosave found in %s" % os.path.join(path, "autosave"))
+
+    @staticmethod
+    def load(path: str, model_file: Optional[str] = None) -> "Project":
         path = os.path.abspath(path)
-        with open(os.path.join(path, "project.json"), "r", encoding="utf-8") as fh:
-            m = json.load(fh)
-        p = Project(m.get("name", os.path.basename(path)), int(m.get("sr", SAMPLE_RATE)))
+        mf = model_file or os.path.join(path, "project.json")
+        try:
+            with open(mf, "r", encoding="utf-8") as fh:
+                m = json.load(fh)
+        except FileNotFoundError:
+            raise ProjectError("not a SAMPire project (no project.json in %s)" % path)
+        except (OSError, ValueError) as exc:
+            raise ProjectError("project file is unreadable (%s); try Project.recover() / ':recover'" % exc)
+        if not isinstance(m, dict) or int(m.get("format", 1)) > FORMAT:
+            raise ProjectError("project was made by a newer SAMPire (format %s)" % (m.get("format") if isinstance(m, dict) else "?"))
+        p = Project(str(m.get("name", os.path.basename(path))), int(m.get("sr", SAMPLE_RATE)))
         p.path = path
-        p._apply_basic(m)
-        db = sqlite3.connect(os.path.join(path, "project.db"))
-        for (aid, name, rel, sha1, sr, frames, meta, ana) in db.execute("SELECT id,name,path,sha1,sr,frames,meta,analysis FROM assets"):
-            full = os.path.join(path, rel)
-            if not os.path.exists(full):
-                found = relink(path, sha1)
-                if found is None:
+        try:
+            p._apply(m)
+        except Exception as exc:  # noqa: BLE001
+            raise ProjectError("project model is damaged: %s" % exc)
+        dbf = os.path.join(path, "project.db")
+        if os.path.exists(dbf):
+            try:
+                db = sqlite3.connect(dbf)
+                rows = db.execute("SELECT id,name,path,sha1,sr,frames,meta,analysis FROM assets").fetchall()
+                db.close()
+            except sqlite3.Error as exc:
+                raise ProjectError("project database is damaged (%s)" % exc)
+            for (aid, name, rel, sha1, sr, frames, meta, ana) in rows:
+                full = os.path.join(path, rel)
+                if not os.path.exists(full):
+                    found = relink(path, sha1)
+                    if found is None:
+                        continue
+                    full = found
+                try:
+                    d, fsr = assetmod.read_audio(full)
+                except Exception:
                     continue
-                full = found
-            d, fsr = assetmod.read_audio(full)
-            a = AudioAsset(id=aid, name=name, data=assetmod.dsp.ensure_2d(d), sr=int(fsr), path=rel, sha1=sha1,
-                           meta=json.loads(meta or "{}"), analysis=json.loads(ana or "{}"))
-            p.assets[aid] = a
-        db.close()
+                p.assets[aid] = AudioAsset(id=aid, name=name, data=assetmod.dsp.ensure_2d(d), sr=int(fsr), path=rel, sha1=sha1,
+                                           meta=json.loads(meta or "{}"), analysis=json.loads(ana or "{}"))
         p.render_all()
         p.dirty = False
         return p
 
-    def _apply_basic(self, m: dict) -> None:
-        self._apply(m)
+    # -- song chain
+    def song_add(self, name: str, reps: int = 1) -> None:
+        if name not in self.patterns:
+            raise ValueError("no pattern named %r" % name)
+        self.song.append((name, max(int(reps), 1)))
+
+    def song_remove(self, index: int) -> None:
+        del self.song[index]
+
+    def song_clear(self) -> None:
+        self.song = []
+
+    def song_move(self, index: int, new_index: int) -> None:
+        item = self.song.pop(index)
+        self.song.insert(max(min(new_index, len(self.song)), 0), item)
+
+    def song_seconds(self) -> float:
+        return sum(self.patterns[n].bars * self.patterns[n].beats_per_bar * 60.0 / self.bpm * r for n, r in self.song if n in self.patterns)
 
     def asset_names(self) -> List[str]:
         return ["%s (%.1fs)" % (a.name, a.duration) for a in self.assets.values()]

@@ -30,11 +30,11 @@ def _fade(x, sr, rng, p):
 
 
 def _pitch(x, sr, rng, p):
-    return dsp.pitch_shift(x, float(p.get("semitones", 0.0)))
+    return dsp.pitch_shift(x, float(p.get("semitones", 0.0)), sr)
 
 
 def _stretch(x, sr, rng, p):
-    return dsp.time_stretch(x, float(p.get("ratio", 1.0)))
+    return dsp.time_stretch(x, float(p.get("ratio", 1.0)), sr)
 
 
 def _rate(x, sr, rng, p):
@@ -97,7 +97,14 @@ def _shuffle(x, sr, rng, p):
     return np.concatenate([dsp.fade(parts[i], 0.5, 0.5, sr) for i in order]).astype(np.float32)
 
 
+def _seamless(x, sr, rng, p):
+    from .loops import make_seamless
+
+    return make_seamless(x, float(p.get("ms", 30)), sr)
+
+
 OPS: Dict[str, Callable] = {
+    "seamless": _seamless,
     "reverse": _reverse, "gain": _gain, "normalize": _normalize, "fade": _fade, "pitch": _pitch, "stretch": _stretch,
     "rate": _rate, "stutter": _stutter, "truncate": _truncate, "loop": _loop, "filter": _filter, "drive": _drive,
     "bitcrush": _bitcrush, "gate": _gate, "tape_stop": _tape_stop, "granular": _granular, "crackle": _crackle,

@@ -157,15 +157,54 @@ def wsola(x: np.ndarray, ratio: float, frame: int = 1024, tol: int = 192) -> np.
     return out[:nout].copy()
 
 
-def time_stretch(x: np.ndarray, ratio: float) -> np.ndarray:
+STRETCH_BACKEND = "wsola"          # wsola (built in) | rubberband (needs the rubberband command line tool)
+
+
+def rubberband_available() -> bool:
+    import shutil
+
+    return shutil.which("rubberband") is not None
+
+
+def set_stretch_backend(name: str) -> None:
+    global STRETCH_BACKEND
+    if name not in ("wsola", "rubberband"):
+        raise ValueError("stretch backend must be 'wsola' or 'rubberband'")
+    if name == "rubberband" and not rubberband_available():
+        raise RuntimeError("the rubberband command line tool was not found (apt install rubberband-cli / brew install rubberband)")
+    STRETCH_BACKEND = name
+
+
+def _rubberband(x: np.ndarray, time_ratio: float, semitones: float, sr: int = 48000) -> np.ndarray:
+    """Rubber Band through its command line tool (temporary wav files). time_ratio = output / input duration."""
+    import os
+    import subprocess
+    import tempfile
+
+    import soundfile as sf
+
+    with tempfile.TemporaryDirectory() as d:
+        a, b = os.path.join(d, "in.wav"), os.path.join(d, "out.wav")
+        sf.write(a, ensure_2d(x), sr, subtype="FLOAT")
+        cmd = ["rubberband", "-q", "-t", "%.8f" % time_ratio, "-p", "%.6f" % semitones, a, b]
+        subprocess.run(cmd, check=True, capture_output=True, timeout=300)
+        y, _ = sf.read(b, dtype="float32", always_2d=True)
+    return ensure_2d(y)
+
+
+def time_stretch(x: np.ndarray, ratio: float, sr: int = 48000) -> np.ndarray:
+    if STRETCH_BACKEND == "rubberband" and abs(ratio - 1.0) > 1e-6 and len(x) > 64:
+        return _rubberband(x, ratio, 0.0, sr)
     return wsola(x, ratio)
 
 
-def pitch_shift(x: np.ndarray, semitones: float) -> np.ndarray:
+def pitch_shift(x: np.ndarray, semitones: float, sr: int = 48000) -> np.ndarray:
     """Pitch shift at constant duration: resample (pitch and speed move) then WSOLA back to length."""
     x = ensure_2d(x)
     if abs(semitones) < 1e-6:
         return x.copy()
+    if STRETCH_BACKEND == "rubberband" and len(x) > 64:
+        return fit_length(_rubberband(x, 1.0, semitones, sr), len(x))
     f = 2.0 ** (semitones / 12.0)
     n = len(x)
     y = resample_ratio(x, 1.0 / f)
@@ -295,3 +334,27 @@ def vinyl_crackle(n: int, sr: int = 48000, density: float = 0.0008, level: float
     y = pops + hiss * 0.15
     y = lfilter(*biquad_coeffs("hp", 800.0, 0.707, sr), y)
     return np.stack([y, np.roll(y, 7)], axis=1).astype(F32) * level
+
+
+def true_peak_db(x: np.ndarray, oversample: int = 4) -> float:
+    """Inter-sample peak estimate in dBFS (4x polyphase oversampling, as in BS.1770 Annex 2)."""
+    y = resample_poly(ensure_2d(x).astype(np.float64), oversample, 1, axis=0)
+    return lin_to_db(float(np.max(np.abs(y))) if len(y) else 0.0)
+
+
+def normalize_lufs(x: np.ndarray, sr: int, target_lufs: float = -14.0, ceiling_db: float = -1.0):
+    """Gain the audio to a target integrated loudness, but never beyond a true-peak ceiling. Returns (audio, info)."""
+    from .analysis import loudness_integrated
+
+    before = loudness_integrated(x, sr)
+    if not np.isfinite(before):
+        return x, {"before": before, "after": before, "gain_db": 0.0, "limited": False}
+    gain = target_lufs - before
+    y = (x * db_to_lin(gain)).astype(F32)
+    tp = true_peak_db(y)
+    limited = False
+    if tp > ceiling_db:
+        gain -= tp - ceiling_db
+        y = (x * db_to_lin(gain)).astype(F32)
+        limited = True
+    return y, {"before": before, "after": loudness_integrated(y, sr), "gain_db": gain, "limited": limited, "true_peak_db": true_peak_db(y)}

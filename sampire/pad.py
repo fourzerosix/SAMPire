@@ -41,6 +41,16 @@ class Pad:
     lp_cut: float = 0.0                         # baked low-pass (Hz), 0 = off
     hp_cut: float = 0.0                         # baked high-pass (Hz), 0 = off
     midi_note: int = 0
+    filter_kind: str = ""                       # realtime per-voice filter: "" off | lp | hp | bp
+    filter_cut: float = 2000.0
+    filter_q: float = 0.9
+    lfo_target: str = ""                        # "" off | pitch (semitones) | cutoff (octaves) | amp | pan
+    lfo_rate: float = 5.0
+    lfo_depth: float = 0.0
+    lfo_shape: str = "sine"                     # sine | tri | square | saw
+    chromatic: bool = False                     # MIDI notes and chromatic keys play this pad at pitch
+    bus: int = 0                                # mixer group bus 0..3
+    protect: bool = False                       # never steal this pad's voices
     variants: List[dict] = field(default_factory=list)   # extra {"start","end","recipe"} for round robin
     variation: str = "none"                     # none | round_robin | random
     # derived, not saved
@@ -110,7 +120,8 @@ class Pad:
         d = {k: getattr(self, k) for k in (
             "index", "name", "label", "asset_id", "start", "end", "mode", "reverse", "gain_db", "pan", "pitch", "fine",
             "attack", "decay", "sustain", "release", "choke_group", "vel_sens", "send_a", "send_b", "lp_cut", "hp_cut",
-            "midi_note", "variation")}
+            "midi_note", "variation", "filter_kind", "filter_cut", "filter_q", "lfo_target", "lfo_rate", "lfo_depth", "lfo_shape",
+            "chromatic", "bus", "protect")}
         d["recipe"] = self.recipe.to_dict()
         d["variants"] = self.variants
         return d

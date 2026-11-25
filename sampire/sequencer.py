@@ -55,6 +55,7 @@ class Pattern:
         self.humanize_vel = 0.0
         self.pad_offset: Dict[int, int] = {}     # per-pad microtiming in ticks
         self.version = 0
+        self.style = ""                          # how it was generated (informational)
 
     # -- geometry
     @property
