@@ -1,4 +1,4 @@
-![SAMPire](https://raw.githubusercontent.com/fourzerosix/SAMPire/main/assets/images/sampire-logo-full.jpg)
+![SAMPire](https://github.com/fourzerosix/SAMPire/blob/main/assets/images/sampire-logo.png)
 
 ---
 
