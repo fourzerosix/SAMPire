@@ -26,17 +26,26 @@ boundaries and mixes the segments in between, so triggers are sample accurate.
 looping. The ADSR envelope is a scalar in sustain and a short vector only during attack, decay and release. Starts and
 ends are click-free: sample heads and tails get fades baked in when the pad is rendered; choke and steal use a 4 ms release.
 
-## Signal flow
+## Signal flow and taps
 
 ```
-voices -> dry --------------------------+
-       -> send A -> DelayFX  -> * ret A -+--> * master gain -> master FX chain -> soft limiter -> out
-       -> send B -> ReverbFX -> * ret B -+                                                   |
-                                                                  skip-back ring, master recorder, resample recorder
+voice (filter, LFO, envelope) -> bus[pad.bus] raw -> bus fx chain (sidechain key = another bus's raw signal) -> bus gain / mute --+
+voice -> send A -> delay  -> * return A -------------------------------------------------------------------------------------+-> * master gain
+voice -> send B -> reverb -> * return B -------------------------------------------------------------------------------------+      |
+audition, input monitor ---------------------------------------------------------------------------------------------------+      v
+                                                                                         master fx chain -> soft limiter -> OUT
+taps: skip-back ring, master recorder, resample recorder all read OUT (post limiter). Stem export bypasses master fx and limiter.
 ```
 
-Effects process feedback structures in chunks no longer than their shortest delay, so output is identical for every
-block size (verified).
+Everything stateful in the rack is exact for any block size: feedback structures run in chunks no longer than their shortest delay, modulation uses an
+absolute sample counter, noise is generated on a fixed grid, and per-voice filter/LFO updates run on a grid aligned to the voice's own age. The selftest
+renders the same project with block sizes 64 to 4096 and compares.
+
+## MIDI and sync
+
+`MidiManager` (threads) -> `MidiRouter.handle(msg)` -> engine commands or `params.apply`. Clock in: `ClockFollower` estimates tempo from the median pulse
+interval and nudges the sequencer anchor every beat (snap above 20 ms, otherwise a 10 percent slew). Clock out: the engine counts 24-per-quarter pulses
+from the sequencer tick position and a thread sends them. Both are best effort: timing comes from Python threads, not a hardware clock.
 
 ## Data model
 

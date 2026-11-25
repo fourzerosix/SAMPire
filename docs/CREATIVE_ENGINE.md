@@ -39,3 +39,18 @@ four-on-the-floor, sparse, euclidean, swing, `N bpm`. Nothing leaves your machin
 
 Every random choice flows from `seed`. Pattern generation, kit generation, recipes, humanize and probability all derive
 their generators from it. Run the same command twice and compare the files.
+
+
+## Plan providers (`providers.py`)
+
+`:prompt` and `--prompt` go through a provider that returns a plan dict. `rules` (default) is the offline parser above. `command:PROGRAM ARGS` runs your program,
+sending `{"prompt": ..., "context": {bpm, key, duration, pads_filled}}` as JSON on stdin and reading a plan as JSON from stdout (60 s timeout, 100 kB cap).
+`python:module:function` imports your function; it runs your code, so it needs `--allow-python-provider`. Whatever a provider returns is passed through
+`validate_plan`: unknown keys are dropped, numbers are clamped, names must come from a whitelist. A plan cannot carry file paths, commands or code, so a language
+model can steer SAMPire without being able to do anything SAMPire does not already do. Nothing is sent anywhere unless you configure a provider that sends it.
+
+## Taste (`taste.py`)
+
+In the Create workspace, `y` keeps what was generated and `n` rejects it (and undoes it). Each decision updates a small logistic model over readable features
+(`label:kick`, `op:reverse`, `len:short`, `style:euclid`, ...). With taste on, slice scoring, transform choice and the `auto` pattern style lean toward what you kept.
+Weights live in `~/.config/sampire/taste.json`; `:taste` shows the strongest ones and `:taste reset` clears them. With no examples it changes nothing, so seeds stay reproducible.

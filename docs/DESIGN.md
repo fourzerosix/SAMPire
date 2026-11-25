@@ -28,7 +28,7 @@ Design principles, in priority order:
 | Desktop GUI (PySide6) as the main UI | Terminal UI first (curses, braille waveforms) | Matches DanEQ, works over SSH/ThinLinc, zero GUI dependencies. The engine is UI-agnostic, so a GUI stays possible. |
 | `aubio` for onset/tempo | Pure NumPy/SciPy by default; `aubio`/`librosa` as optional backends | The original `aubio` package has had no PyPI release since 0.4.9 (2019) and often has no wheel for current Python; the `aubio-ledfx` fork does ship wheels. A hard dependency on either is an install risk. |
 | `python-rtmixer` for the audio path | `sounddevice` callback with NumPy block mixing | `rtmixer` is a thin PortAudio mixer with old wheels; it cannot host per-voice DSP. A sampler needs envelopes, choke groups and sends inside the callback. |
-| Separate native audio engine (C++/Rust) | Python engine now, process boundary designed in | NumPy block mixing uses about 11 percent of real time for 32 voices at block 256 (measured by `--selftest`). The command-queue boundary lets the engine move to its own process or language later without touching the UI. |
+| Separate native audio engine (C++/Rust) | Python engine now, process boundary designed in | NumPy block mixing uses roughly 15 to 25 percent of real time for 32 voices with sends at block 256 (measured by `--selftest`). The command-queue boundary lets the engine move to its own process or language later without touching the UI. |
 | Rubber Band for stretch | Built-in WSOLA, optional later | No native dependency for v0.1; quality is good for loops and bass, softer on dense drum transients (documented). |
 | Neural stem separation (Demucs) in core | Optional plugin, roadmap | Heavy, GPU-hungry, and upstream maintenance has been uneven. Keep it out of the core install. |
 | Vector database for similarity search | In-memory feature vectors now, SQLite index on disk | Fewer than tens of thousands of samples per project does not need a vector DB. |
@@ -59,127 +59,123 @@ Design principles, in priority order:
 
 - Audio interface for low latency and external input sampling; any class-compliant MIDI pad controller.
 
-## 4. Feature catalogue
+## 4. Feature catalogue (v0.2.0)
 
-Status: **done** = in v0.1 and covered by `--selftest` or pytest; **partial** = works with limits; **planned** = see roadmap.
+Status: **done** = implemented and covered by `--selftest` or pytest in a headless environment; **done, hardware untested** = implemented
+against a documented API but not yet exercised with a physical device; **not included** = deliberately left out (reason given).
+Everything listed as planned in v0.1 is now in, except the items under "not included" in section 4.11.
 
 ### 4.1 Input and library
 
 | Feature | Status |
 |---|---|
-| Load wav/flac/aiff/ogg (mp3 where libsndfile supports it), any sample rate, mono or stereo | done |
-| Everything converted once to 48 kHz stereo float32; originals never touched | done |
-| Content hash per asset, relink moved files by hash on project load | done |
-| Built-in synthetic drum break (`--demo`) for first run, tests and CI | done |
-| Live external input, threshold recording with pre-roll | done (engine and `:sample`; needs an input device) |
-| Rolling skip-back buffer of the master output (60 s) | done |
-| Resample: record the master bus into a new asset with lineage (generation counter) | done |
-| Folder browser, tags, ratings, similarity search | planned |
-| Drag-and-drop import in a GUI | planned |
+| Load wav/flac/aiff/ogg (mp3 where libsndfile supports it), any rate, mono or stereo; converted once to 48 kHz stereo float32; originals untouched | done |
+| Content hash per asset; moved files relinked by hash | done |
+| Built-in synthetic drum break (`--demo`) | done |
+| Live input, threshold recording with pre-roll, input monitoring | done, hardware untested |
+| 60 s skip-back of the master, resample the bus into a pad with lineage | done |
+| **Library**: SQLite index of folders, BPM/key/label analysis on scan, tags (auto from folder and file names), ratings, favourites, recents | done |
+| **Search**: text, `bpm:85-95`, `key:C`, `tag:kick`, `rating:3`, `fav`, `recent` | done |
+| **Similarity search** ("sounds like this pad / this file") from a 60-value timbre embedding | done |
+| **Duplicate detection** (identical files; near-identical audio with `dups near`) | done |
+| **Sample pack import** from a zip or folder, safe extraction (no path traversal, size and count caps), tags from names | done |
+| **Drag and drop**: dropping files or folders on the terminal loads them (bracketed paste) | done (terminals that support bracketed paste) |
 
-### 4.2 Analysis ("sample intelligence")
+### 4.2 Analysis
 
 | Feature | Status |
 |---|---|
-| Peak, RMS, BS.1770 K-weighted loudness (ungated, 48 kHz) | done |
-| Onset detection: multi-band SuperFlux-style flux, steepest-rise refinement to about 2 ms | done |
-| Tempo (autocorrelation with prior), beat phase, downbeat guess from low-band energy | done |
-| Key estimate (chroma with harmonic filtering, Krumhansl profiles) | done (reliable on tonal material; drums-only is "unknown") |
-| Monophonic pitch (autocorrelation) | done |
-| Percussive vs harmonic ratio (median-filter HPSS) | done |
-| Hit classification: kick, snare, hat, open hat, tom, bass, tone, perc | partial (rule based; clap lands in snare; a pluggable `Backend` hook exists for an ML model) |
-| Stem separation (drums/bass/vocals/other) | planned (optional plugin) |
-| Embedding-based "find similar" | planned |
+| Peak, RMS, ungated LUFS; **BS.1770 gated integrated LUFS and 4x true peak** | done |
+| Onsets (multi-band SuperFlux style, about 2 ms), tempo, beat phase, downbeats, key, pitch, percussive ratio | done |
+| Hit classification (kick, snare, hat, open hat, tom, bass, tone, perc) | done, heuristic; hook for an ML model |
+| **Stem separation**: built-in DSP split (drums / bass / other, sums back to the input) | done |
+| Stem separation with Demucs (neural) via `--method demucs` | adapter written, **untested** (Demucs is not installed in the test environment) |
+| **Optional backends**: aubio onsets (F1 0.97 vs 0.93 built in), Rubber Band stretch/pitch | done, verified |
 
 ### 4.3 Slicing and chopping
 
 | Feature | Status |
 |---|---|
-| Transient, grid (musical subdivision), equal parts, silence, hybrid (transient nudged to the grid, gap fill) | done |
-| Zero-crossing snap, pre-roll, minimum/maximum length, tail length | done |
-| Slice ranking (strength, variety), automatic pad layout (kick, snare, hats first) | done |
-| Manual slice editing on a waveform (add, move, delete markers) | planned (TUI marker editor) |
-| Loop-point detection and seamless-loop search | planned |
+| Transient, grid, equal, silence, hybrid; zero-crossing snap; pre-roll; tail length; ranking and drum layout | done |
+| **Manual marker editor** (Edit workspace): add, delete, jump, zoom, audition, put chops on pads in time order | done |
+| **Loop-point detection** (whole-bar candidates scored by how well the end joins the start) and **seamless loop** crossfade | done |
+| **Chops like this one** (`:like`): fill free pads with the slices most similar to a pad | done |
 
 ### 4.4 Autonomous editing (recipes)
 
-Nineteen transforms, each deterministic for a seed: reverse, gain, normalize, fade, pitch (duration preserved),
-stretch (pitch preserved), rate (varispeed), stutter, truncate, loop, filter (lp/hp/bp/notch/shelf), drive, bitcrush,
-rhythmic gate, tape stop, granular scatter, vinyl crackle, mono, shuffle (re-order sub-slices).
-Recipes chain, serialize to JSON, and re-render on demand. Status: **done**.
+Twenty nondestructive transforms, each deterministic for a seed: reverse, gain, normalize, fade, pitch, stretch, rate, stutter, truncate, loop,
+filter, drive, bitcrush, rhythmic gate, tape stop, granular, vinyl crackle, mono, shuffle, seamless loop. **done**
 
 ### 4.5 Pads and playback
 
 | Feature | Status |
 |---|---|
-| 4 banks x 16 pads, global pad index, bank switching | done |
-| Modes: one-shot, gate, loop, toggle; reverse flag | done |
-| Velocity sensitivity, gain, pan (constant power), pitch + fine tune (varispeed), ADSR | done |
-| Choke / mute groups (closed vs open hat), 4 ms click-free cuts | done |
-| 32-voice polyphony with oldest-voice stealing | done |
-| Round-robin and random sample variants per pad | done (engine and data model; no UI yet) |
-| Per-pad send levels to delay and reverb buses | done |
-| Baked per-pad low/high-pass | done |
-| Chromatic keyboard mode, per-pad realtime filter/LFO | planned |
+| 4 banks x 16 pads; modes one-shot, gate, loop, toggle; velocity, gain, pan, pitch, fine tune, ADSR; choke groups; 32 voices | done |
+| **Realtime per-pad filter (lp/hp/bp) and LFO** (pitch, cutoff, amp, pan; sine/tri/square/saw), exact for any block size | done |
+| **Chromatic mode** (pad keys and MIDI notes play one pad at pitch) | done |
+| **Round robin / random variants** with a `:variant` command | done |
+| **Note repeat / roll** with live recording into the pattern | done |
+| **Voice stealing policies** (oldest, quietest) and **protected pads** | done |
+| **Pitch bend** (all playing voices), aftertouch mapping | done |
+| Send levels to delay and reverb | done |
 
 ### 4.6 Sequencer
 
 | Feature | Status |
 |---|---|
-| 960 PPQ integer ticks, patterns of any bar count, step grid (16ths) | done |
-| Sample-accurate scheduling independent of block size, zero drift | done (verified for block 32 to 4096) |
-| Swing (global or per pattern), per-pad microtiming, humanize (time and velocity, seeded) | done |
-| Probability, ratchets, conditional triggers (`1:2`), per-hit parameter locks | done (data model and engine; edit via commands) |
-| Note length for gate/loop pads | done |
-| Live pad recording into the pattern with quantize and latency compensation | done |
-| Euclidean generator, quantize, shift, reverse, extend | done |
-| Song mode (chain patterns with repeats) | done (engine/data; simple chain editing is planned) |
-| MIDI clock in/out, Ableton Link | planned |
+| 960 PPQ; sample-accurate, block-size independent, zero drift; swing, microtiming, humanize, probability, ratchets, conditions, parameter locks, note length | done |
+| **Piano-roll style grid with velocity glyphs and a velocity lane**; edit velocity, probability, ratchet, length per step | done |
+| **Song chains** with repeats, reorder, song mode (`:song add/del/move/on/off`) | done |
+| Live recording with quantize and latency compensation; euclid, quantize, shift, reverse, extend | done |
+| **MIDI clock in** (follows tempo, start/stop/continue, song position, phase nudging) | done (simulated clock tested; hardware untested) |
+| **MIDI clock out** (24 pulses per quarter, start/stop) | done (96 pulses in 2 s at 120 BPM verified; hardware untested) |
 
-### 4.7 Effects
+### 4.7 Effects and routing
 
 | Feature | Status |
 |---|---|
-| Delay send (tempo-syncable, filtered feedback), reverb send (Schroeder room) | done |
-| Master chain: filter, drive, bitcrusher; soft limiter (never exceeds full scale) | done |
-| All effects exact for any block size (chunked feedback) | done |
-| Compressor, EQ, flanger/phaser/chorus, vinyl sim, tape wobble | planned (Pedalboard integration as an optional backend) |
-| Per-bus routing graph (groups, sidechain) | planned |
+| Delay, reverb, filter, drive, crusher, **compressor, 3-band EQ, chorus, flanger, phaser, tape wobble, vinyl, ring modulator** | done, all exact for any block size |
+| **Per-bus routing**: 4 group buses with effect chains, gain, mute, and **sidechain** (ducks 27x in the test) | done |
+| **Mixer workspace** with meters and gain-reduction readout | done |
+| **Pedalboard backend** (studio effects, VST3/AU plugin hosting) | done, built-in effects verified; hosting a real VST3 **untested**, and a plugin crash would take the process down (no isolation) |
+| Effects, buses and sends saved in the project and covered by undo | done |
 
 ### 4.8 Recording and export
 
 | Feature | Status |
 |---|---|
-| Record the master output to wav (in memory while recording, written on stop) | done |
-| Offline bounce of a pattern or song, deterministic | done |
-| Stems (one wav per pad, aligned at time zero) | done |
-| Pad wavs, raw slices, MIDI file of a pattern (own writer, no dependency) | done |
-| 16, 24, 32-bit float; wav and flac | done |
-| Per-bus stems with effects, loudness-targeted export | planned |
+| Master recorder, offline bounce, stems per pad, pad wavs, slices, MIDI file | done |
+| **Per-bus stems with effects** (sum back to the mix; master effects and limiter bypassed) | done |
+| **Loudness-targeted export** (`--lufs -14`, true-peak ceiling -1 dB, reports when the ceiling limited it) | done |
 
 ### 4.9 Creative engine
 
 | Feature | Status |
 |---|---|
-| Kit generation: analyse, slice, choose varied slices, label, transform some, assign, set modes and choke groups | done |
-| Controls: pad count, slicing mode, sensitivity, experimental amount, keep-original ratio, percussive/melodic preference, length preference, seed | done |
-| Pattern generation: break, four on the floor, sparse, euclidean, chops; density, consistency across bars, swing | done |
-| Pattern variation (drop, shift, ratchet, probability, ghost notes) and chop-flip (play the chops in a new order) | done |
-| Plain-English instructions, parsed offline into a plan (`:prompt`, `--prompt`) | done (rule based) |
-| Pluggable plan provider so an external language model can emit the same plan schema | planned |
-| Learned taste (what you keep vs discard) | planned |
+| Kit generation, pattern generation (+ `auto` style), variation, chop-flip, offline instructions | done |
+| **Pluggable plan provider**: `rules`, `command:PROGRAM`, `python:module:function` (opt-in); plans are validated and clamped (no paths, commands or code can pass through) | done |
+| **Learned taste**: keep / reject generated kits and patterns; a small local model biases slice choice, transforms and pattern style; inspectable and resettable | done |
+| Accept / reject loop in the Create workspace (reject undoes and teaches) | done |
 
-### 4.10 Project, history, interface
+### 4.10 Project, history, interface, reliability
 
 | Feature | Status |
 |---|---|
-| Project folder: human readable `project.json`, SQLite index, audio copies | done |
-| 100-step undo/redo (snapshots of everything except audio), rolling autosave | done |
-| btop-style TUI: 4x4 pad grid with flash, braille waveform with slice markers and playhead, step grid with playhead, meters, command line, 5 themes, mouse pads | done |
-| MIDI notes to pads, CC mapping with learn, MIDI start/stop | done (needs `sampire[midi]`; untested on hardware in CI) |
-| Headless CLI: `--analyze`, `--chop`, `--render` (whole pipeline), `--selftest` | done |
-| Piano-roll, marker editor, FX panel | planned |
-| GUI frontend over the same engine | planned |
+| Project folder (JSON + SQLite + audio), 100-step undo/redo, **timestamped autosave (keeps 5), crash recovery (`:recover`)**, friendly errors for corrupt or newer projects | done |
+| **Seven workspaces**: Perform, Edit, Sequence, Mixer, Create, Library, Diagnostics (F1-F7, `^N`, `:view`) | done |
+| **MIDI framework**: default pad map (36 + index), CC defaults (7 master, 10 pan, 16-31 pad parameters), learn with global and per-project maps, program change selects bank, pitch bend, aftertouch, **hot-plug and unplug survival** | done, hardware untested |
+| **Diagnostics**: device state, CPU, voices, underruns, memory, backends, MIDI | done |
+| **Soak test** (`--soak`), headless pipeline, `--selftest` (27 checks), 39 pytest tests incl. the real curses UI in a pty | done |
+
+### 4.11 Not included, and why
+
+| Item | Why |
+|---|---|
+| Ableton Link | Needs the native Link library and a Python binding I could not verify here. MIDI clock in and out cover sync. A `SyncSource`-style adapter is the right place for it later. |
+| Graphical (Qt/web) frontend | The terminal is the frontend. The engine, project model and command layer are UI independent, so a GUI can be added, but it is a separate project. Drag and drop works through the terminal. |
+| Engine in its own process | Keeping state (pad samples, patterns, effects) in sync across processes is a large source of bugs. Measured headroom is high (32 voices with sends at roughly 15 to 25 percent of real time; the 20 s soak with effects on every bus runs 3x faster than real time). Revisit only if your hardware tests show dropouts at block 256. |
+| Native (C++/JUCE) engine and plugin formats from the second notes | A different project. Kept as a long-term option; the command-queue boundary is the seam. See `NOTES_DIGEST.md`. |
+| Crash isolation for hosted plugins | Needs a separate plugin-host process. |
 
 ## 5. Components
 
@@ -192,7 +188,8 @@ Recipes chain, serialize to JSON, and re-render on demand. Status: **done**.
                  +--------------------------v--------------------------------------+
                  |  engine.py  render_block(n)   <-- called by backend.py callback  |
                  |   sequencer.Scheduler -> events at exact frames                  |
-                 |   voice.py  x32 -> dry / send A / send B -> fx.py -> limiter     |
+                 |   voice.py  x32 (filter, LFO) -> bus 1-4 (fx, sidechain, gain)  |
+                 |       -> + send A / send B -> master fx -> limiter               |
                  |   taps: skip-back ring, master recorder, resample recorder       |
                  +--------------------------+--------------------------------------+
                                             |
@@ -204,7 +201,7 @@ Offline modules used by both the UI and the headless CLI: `asset.py` (I/O), `ana
 
 ## 6. Quality bar (what `--selftest` proves)
 
-Sixteen checks, all headless and deterministic: file I/O and resampling, onset F1 and timing error, tempo across
+Twenty-seven checks, all headless and deterministic (sixteen core checks plus effects, buses, voice modulation, stems/loops/embeddings, library, MIDI, providers/taste, loudness and bus stems, recovery, optional backends, soak): file I/O and resampling, onset F1 and timing error, tempo across
 80 to 140 BPM, pitch/key/class, slice cuts, stretch and pitch accuracy, voice stealing/choke/varispeed, sequencer
 timing identical for block sizes 32 to 4096, full-engine render identical for block 64/256/1000/4096 with effects,
 determinism per seed, bit-exact recording taps, project round trip with undo and relink, creative pipeline, exports,
@@ -214,10 +211,11 @@ limiter ceiling, and CPU headroom for 32 voices.
 
 - **Python and the GIL.** The UI redraw can compete with the audio callback. Mitigation today: lean drawing, cached
   waveforms, 2 percent CPU measured while playing. If you hear dropouts at small block sizes, raise `--block` to 512.
-  The planned fix is moving the engine into its own process behind the existing command queue.
-- **Not yet tested on real hardware, macOS, or Rocky 9.** The sandbox this was built in has no audio device. The silent
-  backend, offline render, and pty-driven UI are tested; PortAudio output, input sampling and MIDI are written to the
-  documented APIs but unverified on your machine. `--selftest` and `--list-devices` are the first things to run.
+  If your hardware tests show it, the fix is moving the engine into its own process behind the existing command queue (see 4.11).
+- **Not yet tested on real hardware, macOS, or Rocky 9.** The sandbox this was built in has no audio device and no MIDI hardware. The silent
+  backend, offline render, simulated MIDI (fake ports and a simulated clock), and the pty-driven UI are tested; PortAudio output,
+  input sampling, real MIDI devices, Demucs and hosted plugins are unverified on your machine. Run `sampire --selftest`,
+  `sampire --list-devices`, `sampire --midi-ports` and `sampire --diagnostics` first.
 - **Classification is heuristic.** It is tuned on synthetic drums and will mislabel real material sometimes. Labels only
   drive pad order and choke defaults; you can rename and reassign freely.
 - **Time stretch is WSOLA.** Excellent on tones and loops, softer on dense transients. Short one-shots fall back to
@@ -226,5 +224,4 @@ limiter ceiling, and CPU headroom for 32 voices.
 
 ## 8. Where to go next
 
-See `ROADMAP.md`. The shortest path to a much better instrument: waveform marker editor, per-pad realtime filter and
-LFO, the engine in its own process, and a Pedalboard-backed effects chain.
+See `ROADMAP.md`. First: hardware testing and bug reports from real use. Then whatever those tests show matters most.
